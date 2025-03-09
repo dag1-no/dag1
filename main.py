@@ -6,12 +6,16 @@ from pathlib import Path
 
 from httpx import get, post, Response
 from polars import read_csv
+import polars as pl
 
 
 def main() -> None:
     get_absence_from_work_due_to_illness()
     get_nok_eur()
+    get_nok_usd()
     get_cpi()
+    get_us_cpi()
+    get_nominal_wages()
     get_real_wages()
     get_government_expenses_from_ssb()
     get_petroleum_fund_data()
@@ -65,6 +69,26 @@ def get_nok_eur() -> None:
     delete_and_write_csv(observations, Path("sources/norges_bank/nok_eur.csv"))
 
 
+def get_nok_usd() -> None:
+    response = get(
+        "https://data.norges-bank.no/api/data/EXR/A.USD.NOK.SP?format=sdmx-json&startPeriod=1970-01-01&endPeriod=2025-03-08&locale=no"
+    )
+    json = response.json()
+    labels = json["data"]["structure"]["dimensions"]["observation"][0]["values"]
+    values = json["data"]["dataSets"][0]["series"]["0:0:0:0"]["observations"]
+    observations = []
+    for index, label in enumerate(labels):
+        value = values[str(index)][0]  # Get value or None if missing
+        _date = label["end"].split("T")[0]
+        observations.append(
+            {
+                "date": _date,
+                "value": float(value),
+            }
+        )
+    delete_and_write_csv(observations, Path("sources/norges_bank/nok_usd.csv"))
+
+
 def get_cpi() -> None:
     response = _post(
         "https://data.ssb.no/api/v0/no/table/03013/",
@@ -87,6 +111,24 @@ def get_cpi() -> None:
     )
     observations = simplify_jsonstat2(response)
     delete_and_write_csv(observations, Path("sources/ssb/cpi.csv"))
+
+
+def get_nominal_wages() -> None:
+    response = _post(
+        "https://data.ssb.no/api/v0/no/table/09786/",
+        [
+            {
+                "code": "ContentsCode",
+                "selection": {
+                    "filter": "item",
+                    "values": ["Arslonn"],
+                },
+            }
+        ],
+    )
+    observations = simplify_jsonstat2(response)
+
+    delete_and_write_csv(observations, Path("sources/ssb/nominal_wages.csv"))
 
 
 def get_real_wages() -> None:
@@ -125,6 +167,51 @@ def get_government_expenses_from_ssb() -> None:
     for observation in observations:
         observation["value"] = observation["value"] / 1000
     delete_and_write_csv(observations, Path("sources/ssb/government_expenses.csv"))
+
+
+# Get US CPI data from the Federal Reserve Bank of St. Louis from 1970 to today.
+# only use the modules we have already imported
+
+
+def get_us_cpi() -> None:
+    """
+    Fetch US CPI data from FRED (1970–2024), aggregate to yearly averages, and save as CSV.
+    Uses CPIAUCSL (seasonally adjusted) series.
+    """
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL&cosd=1970-01-01&coed=2024-12-31"
+    response = _get(url)
+
+    # Parse CSV with Polars
+    df = read_csv(response.content)
+
+    # Ensure expected columns are present
+    if "observation_date" not in df.columns or "CPIAUCSL" not in df.columns:
+        print("Column names in CSV:", df.columns)
+        raise KeyError(
+            "Expected columns 'observation_date' and 'CPIAUCSL' not found in FRED CSV data."
+        )
+
+    # Convert observation_date to datetime and extract year
+    df = df.with_columns(
+        [
+            pl.col("observation_date")
+            .str.strptime(pl.Date, "%Y-%m-%d")
+            .alias("date_obj"),
+            pl.col("CPIAUCSL").cast(pl.Float64).alias("value"),
+        ]
+    ).with_columns([pl.col("date_obj").dt.year().alias("year")])
+
+    # Group by year and calculate mean CPI
+    yearly_df = df.group_by("year").agg([pl.col("value").mean().alias("value")])
+
+    # Create year-end date strings (e.g., "1970-12-31")
+    observations = [
+        {"date": f"{row['year']}-12-31", "value": row["value"]}
+        for row in yearly_df.sort("year").to_dicts()
+    ]
+
+    # Save to CSV
+    delete_and_write_csv(observations, Path("sources/us_fred/us_cpi.csv"))
 
 
 def parse_petroleum_fund_data(text: str) -> list[dict]:
